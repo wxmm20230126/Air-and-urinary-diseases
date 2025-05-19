@@ -1,0 +1,286 @@
+
+
+
+#####Remove Outliers
+remove_outliers_iqr <- function(column) {
+  Q1 <- quantile(column, 0.25, na.rm = TRUE)  # Q1
+  Q3 <- quantile(column, 0.75, na.rm = TRUE)  # Q3
+  IQR <- Q3 - Q1  
+
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  
+  column[column < lower_bound | column > upper_bound] <- NA
+  return(column)
+}
+
+
+
+
+#####propensity score matching
+for (col in cols_to_transform) {
+
+  non_na_data <- na.omit(pros_sub[[col]])
+  
+  bc <- BoxCoxTrans(non_na_data, na.rm  = TRUE)
+  
+  pros_transformed[[col]] <- predict(bc, pros_sub[[col]])
+}
+
+
+
+
+#####baseline table
+set.seed(2025)
+pollutants <- c("NO2_2010Y", "NOx_2010Y", 
+                "pm2.5_2010Y", "pm2.5_10_2010Y", "pm10_2010Y")
+for (var in pollutants) {
+
+  safe_var <- ifelse(grepl("\\.", var), paste0("`", var, "`"), var)
+  
+  new_var <- paste0(var, "_exposed")
+
+  pros.m <- pros.m %>%
+    mutate(!!new_var := if_else(
+      !!rlang::parse_expr(safe_var) > median(!!rlang::parse_expr(safe_var), na.rm  = TRUE),
+      1,0
+    ))
+}
+#output
+gaze_output=gaze(NO2_2010Y_exposed ~ Age + BMI + Smoking + HBP + T2DM, data = pros.m)
+table=myft(gaze_output)
+table
+table2docx(target="baseline.no2.docx",table)
+
+
+
+#####Construction of prospective Model
+results <- list()
+
+for (exposure in exposures) {
+ 
+  formula_unadjusted <- as.formula(paste("Surv(HR_BPHtime,  BPH) ~", exposure))
+  cox_unadjusted <- coxph(formula_unadjusted, data = df)
+  
+  formula_adjusted <- as.formula(paste("Surv(HR_BPHtime,  BPH) ~", exposure, "+", 
+                                       paste(covariates, collapse = " + ")))
+  cox_adjusted <- coxph(formula_adjusted, data = df)
+
+  extract_cox_results <- function(model, exposure) {
+    s <- summary(model)
+    data.frame( 
+      Exposure = exposure,
+      HR = round(exp(coef(model)[exposure]), 4),
+      CI_low = round(exp(confint(model)[exposure, 1]), 4),
+      CI_high = round(exp(confint(model)[exposure, 2]), 4),
+      P_value = format.pval(s$coefficients[exposure,  "Pr(>|z|)"], digits = 4, eps = 0.001),
+      N = model$n,
+      Model = ifelse(length(coef(model)) > 1, "Adjusted", "Unadjusted")
+    )
+  }
+
+  results[[paste0(exposure, "_unadjusted")]] <- extract_cox_results(cox_unadjusted, exposure)
+  results[[paste0(exposure, "_adjusted")]] <- extract_cox_results(cox_adjusted, exposure)
+}
+
+results_df <- bind_rows(results) %>%
+  arrange(Exposure, Model) %>% 
+  select(Exposure, Model, everything())
+results_df$Type="BPH"
+
+
+
+
+
+#####Construction of retrospective Model
+library(data.table) 
+library(dplyr)
+library(broom) 
+binary_outcomes <- c() 
+continuous_outcomes <- c()   
+covariates <- c()  
+model_types <- c()  
+result_list <- list()
+
+for (outcome in c(binary_outcomes, continuous_outcomes)) {
+
+  for (exposure in exposures) {
+
+    if (all(is.na(pros.m[[outcome]]))  || all(is.na(pros.m[[exposure]])))  next 
+    
+    for (model_type in model_types) {
+
+      if (model_type == "unadjusted") {
+
+        formula_str <- paste(outcome, "~", exposure)
+
+      } else {
+
+        formula_str <- paste(outcome, "~", exposure, "+", paste(covariates, collapse = "+"))
+      }
+      
+      model <- tryCatch(
+        if (outcome %in% binary_outcomes) {
+          glm(as.formula(formula_str),  data = pros.m, family = binomial, na.action  = na.omit) 
+        } else {
+          lm(as.formula(formula_str),  data = pros.m, na.action  = na.omit) 
+        },
+        error = function(e) NULL,
+        warning = function(w) NULL 
+      )
+      
+      if (is.null(model))  next 
+      
+      model_summary <- tidy(model, conf.int  = TRUE) %>%
+        filter(term == exposure) %>%
+        mutate(
+          n_obs = nobs(model),
+          adjusted = ifelse(model_type == "adjusted", "Yes", "No")
+        )
+      
+      if (nrow(model_summary) > 0) {
+        result_list[[length(result_list) + 1]] <- data.frame( 
+          outcome = outcome,
+          exposure = exposure,
+          adjust = model_summary$adjusted,
+          N = model_summary$n_obs,
+          OR = ifelse(outcome %in% binary_outcomes,
+                       exp(model_summary$estimate),
+                       model_summary$estimate),
+          P = model_summary$p.value, 
+          CI_L = ifelse(outcome %in% binary_outcomes,
+                        exp(model_summary$conf.low), 
+                        model_summary$conf.low), 
+          CI_H = ifelse(outcome %in% binary_outcomes,
+                        exp(model_summary$conf.high), 
+                        model_summary$conf.high) 
+        )
+      }
+    }
+  }
+}
+
+result_df <- bind_rows(result_list) %>%
+  mutate(
+    across(c(OR, CI_L, CI_H), ~ round(., 4)),
+    P = signif(P, 3),
+    adjust = factor(adjust, levels = c("No", "Yes"))
+  ) %>%
+  arrange(outcome, rxposure, adjust)
+
+
+
+#####Restricted cubic spline (RCS) analysis
+library(rms)
+library(ggplot2)
+library(splines)
+library(scales)
+library(gridExtra)
+pros.m=as.data.frame(fread("pros.m.csv"))
+
+dd <- datadist(PMdiet) 
+options(datadist='dd')
+# fit mocel
+fit<- lrm(BPH ~ rcs(pm2.5_2010Y, 4) + 
+            Age + BMI + Smoking + HBP + DM +rategroup,
+          data = PMdiet, x = TRUE, y = TRUE)  
+anova(fit)
+HR<-Predict(fit, pm2.5_2010Y,fun=exp,ref.zero = TRUE)
+
+HR1 <- Predict(fit, pm2.5_2010Y, rategroup=c('HighFat','LowFat'),
+               fun=exp,type="predictions",
+               ref.zero=TRUE,conf.int = 0.95,digits=2)
+ggplot()+
+  geom_line(data=HR1, aes(pm2.5_2010Y,yhat, color = rategroup),
+            linetype="solid",size=1,alpha = 0.7)+
+  geom_ribbon(data=HR1, 
+              aes(pm2.5_2010Y,ymin = lower, ymax = upper,fill = rategroup),
+              alpha = 0.1)+
+  scale_color_manual(values = c('#d40e8c','#0070b9'))+
+  scale_fill_manual(values = c('#d40e8c','#0070b9'))+
+  theme_classic()+
+  geom_hline(yintercept=1, linetype=2,size=1)+
+  labs(title = "BPH Risk", x="pm2.5_2010Y", y="HR (95%CI)") 
+ggsave("PM2.5_rategroup.pdf",  combined_plot, 
+       width = 5, height = 4, dpi = 600)
+
+
+
+
+
+library(data.table)
+library(dplyr)
+library(mediation)
+set.seed(2024)
+pros.m=as.data.frame(fread("pros.m.csv"))
+
+# Loop over each variable in your list
+for (var in variables) {
+  
+  # Step 1: Remove NAs and handle extreme values (outliers)
+  meta.no.bex <- df5[!is.na(df5[[var]]), ]
+  
+  # Ensure that the variable is numeric for outlier handling
+  meta.no.bex[[var]] <- as.numeric(meta.no.bex[[var]])
+  
+  # Step 2: Perform mediation analysis for each variable
+  # Mediator model (rate -> var)
+  formula1 <- paste(var, "~ pm2.5_2010Y")
+  mediator_model <- lm(as.formula(formula1), data = meta.no.bex)
+  
+  # Outcome model (rate + var -> BPH)
+  formula2 <- paste("BPH ~ pm2.5_2010Y +",var)
+  outcome_model <- glm(as.formula(formula2), data = meta.no.bex, family = binomial(link = "logit"))
+  
+  # Mediation analysis
+  med_analysis <- mediate(mediator_model, outcome_model, treat = "pm2.5_2010Y", mediator = var, boot = TRUE, sims = 1000)
+  
+  summary_med_analysis <- summary(med_analysis)
+  
+  # Store summary results
+  summary_data <- data.frame(
+    Estimate = c(summary_med_analysis$d1, summary_med_analysis$z1, summary_med_analysis$n1, summary_med_analysis$tau.coef),
+    `95% CI Lower` = c(summary_med_analysis$d1.ci[1], summary_med_analysis$z1.ci[1], summary_med_analysis$n1.ci[1], summary_med_analysis$tau.ci[1]),
+    `95% CI Upper` = c(summary_med_analysis$d1.ci[2], summary_med_analysis$z1.ci[2], summary_med_analysis$n1.ci[2], summary_med_analysis$tau.ci[2]),
+    `p-value` = c(summary_med_analysis$d1.p, summary_med_analysis$z1.p, summary_med_analysis$n1.p, summary_med_analysis$tau.p)
+  )
+  
+  # Add row names and save results
+  rownames(summary_data) <- c("ACME", "ADE", "Prop.Medi", "Total Effect")
+  rownames(summary_data) <- paste(rownames(summary_data), var, sep = "_")
+  
+  # Step 3: Adjust covariates in the models
+  # Mediator model (rate -> var)
+  formula1 <- paste(var, "~ pm2.5_2010Y +Age + BMI + Smoking + HBP + DM")
+  mediator_model_adjusted  <- lm(as.formula(formula1), data = meta.no.bex)
+  
+  # Outcome model (rate + var -> BPH)
+  formula2 <- paste("BPH ~ ",var," +pm2.5_2010Y +Age + BMI + Smoking + HBP + DM")
+  outcome_model_adjusted  <- glm(as.formula(formula2), data = meta.no.bex, family = binomial(link = "logit"))
+  
+  # Mediation analysis
+  med_analysis_adjusted  <- mediate(mediator_model_adjusted, outcome_model_adjusted, treat = "pm2.5_2010Y", mediator = var, boot = TRUE, sims = 1000)
+  
+  summary_med_analysis_adjusted <- summary(med_analysis_adjusted)
+  
+  # Store adjusted summary results
+  summary_data_adjusted <- data.frame(
+    Estimate = c(summary_med_analysis_adjusted$d1, summary_med_analysis_adjusted$z1, summary_med_analysis_adjusted$n1, summary_med_analysis_adjusted$tau.coef),
+    `95% CI Lower` = c(summary_med_analysis_adjusted$d1.ci[1], summary_med_analysis_adjusted$z1.ci[1], summary_med_analysis_adjusted$n1.ci[1], summary_med_analysis_adjusted$tau.ci[1]),
+    `95% CI Upper` = c(summary_med_analysis_adjusted$d1.ci[2], summary_med_analysis_adjusted$z1.ci[2], summary_med_analysis_adjusted$n1.ci[2], summary_med_analysis_adjusted$tau.ci[2]),
+    `p-value` = c(summary_med_analysis_adjusted$d1.p, summary_med_analysis_adjusted$z1.p, summary_med_analysis_adjusted$n1.p, summary_med_analysis_adjusted$tau.p)
+  )
+  
+  # Add row names and save adjusted results
+  rownames(summary_data_adjusted) <- c("ACME", "ADE", "Prop.Medi", "Total Effect")
+  rownames(summary_data_adjusted) <- paste(rownames(summary_data_adjusted), var, sep = "_adjust")
+  
+  # Combine results
+  summaryall <- rbind(summary_data, summary_data_adjusted)
+  summaryall$N=length(meta.no.bex[[var]])
+  final_df <- rbind(final_df, summaryall)
+}
+write.csv(final_df,"PM2.5.mediator.csv",row.names = T)
+
+
+
