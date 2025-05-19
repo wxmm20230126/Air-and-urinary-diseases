@@ -216,20 +216,11 @@ pros.m=as.data.frame(fread("pros.m.csv"))
 
 # Loop over each variable in your list
 for (var in variables) {
-  
-  # Step 1: Remove NAs and handle extreme values (outliers)
-  meta.no.bex <- df5[!is.na(df5[[var]]), ]
-  
-  # Ensure that the variable is numeric for outlier handling
-  meta.no.bex[[var]] <- as.numeric(meta.no.bex[[var]])
-  
-  # Step 2: Perform mediation analysis for each variable
-  # Mediator model (rate -> var)
-  formula1 <- paste(var, "~ pm2.5_2010Y")
+ 
+  formula1 <- paste(var, "~ pm2.5_2010Y")   ####Add adjusted variates
   mediator_model <- lm(as.formula(formula1), data = meta.no.bex)
-  
-  # Outcome model (rate + var -> BPH)
-  formula2 <- paste("BPH ~ pm2.5_2010Y +",var)
+
+  formula2 <- paste("BPH ~ pm2.5_2010Y +",var)   ####Add adjusted variates
   outcome_model <- glm(as.formula(formula2), data = meta.no.bex, family = binomial(link = "logit"))
   
   # Mediation analysis
@@ -248,39 +239,8 @@ for (var in variables) {
   # Add row names and save results
   rownames(summary_data) <- c("ACME", "ADE", "Prop.Medi", "Total Effect")
   rownames(summary_data) <- paste(rownames(summary_data), var, sep = "_")
-  
-  # Step 3: Adjust covariates in the models
-  # Mediator model (rate -> var)
-  formula1 <- paste(var, "~ pm2.5_2010Y +Age + BMI + Smoking + HBP + DM")
-  mediator_model_adjusted  <- lm(as.formula(formula1), data = meta.no.bex)
-  
-  # Outcome model (rate + var -> BPH)
-  formula2 <- paste("BPH ~ ",var," +pm2.5_2010Y +Age + BMI + Smoking + HBP + DM")
-  outcome_model_adjusted  <- glm(as.formula(formula2), data = meta.no.bex, family = binomial(link = "logit"))
-  
-  # Mediation analysis
-  med_analysis_adjusted  <- mediate(mediator_model_adjusted, outcome_model_adjusted, treat = "pm2.5_2010Y", mediator = var, boot = TRUE, sims = 1000)
-  
-  summary_med_analysis_adjusted <- summary(med_analysis_adjusted)
-  
-  # Store adjusted summary results
-  summary_data_adjusted <- data.frame(
-    Estimate = c(summary_med_analysis_adjusted$d1, summary_med_analysis_adjusted$z1, summary_med_analysis_adjusted$n1, summary_med_analysis_adjusted$tau.coef),
-    `95% CI Lower` = c(summary_med_analysis_adjusted$d1.ci[1], summary_med_analysis_adjusted$z1.ci[1], summary_med_analysis_adjusted$n1.ci[1], summary_med_analysis_adjusted$tau.ci[1]),
-    `95% CI Upper` = c(summary_med_analysis_adjusted$d1.ci[2], summary_med_analysis_adjusted$z1.ci[2], summary_med_analysis_adjusted$n1.ci[2], summary_med_analysis_adjusted$tau.ci[2]),
-    `p-value` = c(summary_med_analysis_adjusted$d1.p, summary_med_analysis_adjusted$z1.p, summary_med_analysis_adjusted$n1.p, summary_med_analysis_adjusted$tau.p)
-  )
-  
-  # Add row names and save adjusted results
-  rownames(summary_data_adjusted) <- c("ACME", "ADE", "Prop.Medi", "Total Effect")
-  rownames(summary_data_adjusted) <- paste(rownames(summary_data_adjusted), var, sep = "_adjust")
-  
-  # Combine results
-  summaryall <- rbind(summary_data, summary_data_adjusted)
-  summaryall$N=length(meta.no.bex[[var]])
-  final_df <- rbind(final_df, summaryall)
-}
-write.csv(final_df,"PM2.5.mediator.csv",row.names = T)
+ }
+write.csv(your_data,"PM2.5.mediator.csv",row.names = T)
 
 
 
